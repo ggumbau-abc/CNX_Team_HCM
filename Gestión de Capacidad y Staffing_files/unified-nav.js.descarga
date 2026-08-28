@@ -1,0 +1,813 @@
+/**
+ * Inject FDS Noto Sans fonts into the main document (once) so the
+ * Shadow DOM can inherit them via the CSS font stack.
+ */
+(() => {
+  if (document.getElementById("ix-fds-fonts")) return;
+  const link = document.createElement("link");
+  link.id = "ix-fds-fonts";
+  link.rel = "stylesheet";
+  link.href =
+    "https://fonts.googleapis.com/css2?family=Noto+Sans:wght@100..900&family=Noto+Sans+Display:wght@100..900&display=swap";
+  document.head.appendChild(link);
+})();
+
+/**
+ * Capture the base URL of this script at parse time so the component can
+ * self-discover where links.json lives regardless of where it is hosted.
+ *
+ * document.currentScript is null for deferred scripts, so we fall back to
+ * scanning document.scripts for a tag whose src contains "unified-nav".
+ * This makes zero-config deployment to any CDN possible: just drop both
+ * files in the same location and the component figures out the rest.
+ */
+const _SCRIPT_BASE = (() => {
+  const src = (document.currentScript ?? Array.from(document.scripts).find((s) => s.src.includes("unified-nav")))?.src;
+  return src ? src.replace(/\/[^/]+$/, "/") : null;
+})();
+
+/**
+ * Service to fetch and cache Navigation Links
+ */
+class NavigationService {
+  static CACHE_KEY = "ix_unified_nav_links_v2";
+  static CACHE_EXPIRY_KEY = "ix_unified_nav_links_expiry";
+  static CACHE_TTL_MS = 1000 * 60 * 60; // 1 Hour cache TTL
+
+  /**
+   * Internal: fetch links.json, populate the session cache, and return the
+   * full raw data object (all products × all envs).  Both public methods
+   * below delegate here so the cache is always shared.
+   */
+  static async _fetchAndCache(sourceUrl, isLocal) {
+    const now = Date.now();
+    const cachedData = sessionStorage.getItem(this.CACHE_KEY);
+    const cacheExpiry = sessionStorage.getItem(this.CACHE_EXPIRY_KEY);
+
+    if (!isLocal && cachedData && cacheExpiry && now < parseInt(cacheExpiry, 10)) {
+      return JSON.parse(cachedData);
+    }
+
+    const response = await fetch(sourceUrl, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      cache: isLocal ? "no-store" : "default",
+    });
+
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+    const fullData = await response.json();
+
+    if (!isLocal) {
+      sessionStorage.setItem(this.CACHE_KEY, JSON.stringify(fullData));
+      sessionStorage.setItem(this.CACHE_EXPIRY_KEY, (now + this.CACHE_TTL_MS).toString());
+    }
+
+    return fullData;
+  }
+
+  /**
+   * Returns the full raw data without environment filtering.
+   * Used by the auto-detection path in connectedCallback.
+   */
+  static async getRawLinks(sourceUrl, isLocal) {
+    try {
+      return await this._fetchAndCache(sourceUrl, isLocal);
+    } catch (error) {
+      console.error("UnifiedNav Widget: Failed to load navigation links from", sourceUrl, error);
+      return null;
+    }
+  }
+
+  /**
+   * Returns data filtered to the requested environment ('prod' or 'dev').
+   */
+  static async getLinks(env, sourceUrl, isLocal) {
+    try {
+      const fullData = await this._fetchAndCache(sourceUrl, isLocal);
+
+      const filteredResponse = {};
+      for (const [product, environments] of Object.entries(fullData)) {
+        filteredResponse[product] = environments[env] || [];
+      }
+
+      return filteredResponse;
+    } catch (error) {
+      console.error("UnifiedNav Widget: Failed to load navigation links from", sourceUrl, error);
+      return null;
+    }
+  }
+
+  /**
+   * Scan every URL in rawData and return the { product, env } pair whose URL
+   * hostname exactly matches the supplied hostname, or null if none matches.
+   * Checks all URL fields: url, sidekick, admin.
+   */
+  static detectContext(rawData, hostname) {
+    for (const [product, environments] of Object.entries(rawData)) {
+      for (const [env, links] of Object.entries(environments)) {
+        if (!Array.isArray(links)) continue;
+        for (const link of links) {
+          const candidates = [link.url, link.sidekick, link.admin].filter(Boolean);
+          for (const url of candidates) {
+            try {
+              if (new URL(url).hostname === hostname) return { product, env, region: link.region || null };
+            } catch {
+              // malformed URL in data — skip
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * For local development: probe ./links.json first; if unavailable fall back
+   * to the CDN base URL derived from the script tag, or the hardcoded default.
+   */
+  static async resolveLocalUrl() {
+    // Always prefer the script-derived base URL so that relative resolution is
+    // anchored to the script's directory, not the current page path.
+    // This prevents e.g. localhost/api/integrations/links.json when the page
+    // is at /api/integrations but the script lives at the root.
+    if (_SCRIPT_BASE) return _SCRIPT_BASE + "links.json";
+    try {
+      const res = await fetch("./links.json", { method: "HEAD", cache: "no-store" });
+      if (res.ok) return "./links.json";
+    } catch {
+      // ./links.json not reachable — fall through
+    }
+    return "https://dnnuu05gzae40.cloudfront.net/links.json";
+  }
+}
+
+/**
+ * Web Component: <ix-unified-nav>
+ */
+class UnifiedNav extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+
+    this.isOpen = false;
+    this.isLoading = false;
+    this.hasError = false;
+    this.data = null;
+    this.displayNames = {};
+    this.currentRegion = null;
+    this._prodLocked = false;
+
+    this.toggleDropdown = this.toggleDropdown.bind(this);
+    this.handleOutsideClick = this.handleOutsideClick.bind(this);
+  }
+
+  async connectedCallback() {
+    // 1. Read attributes — may be partially overridden by auto-detection below.
+    this.currentEnv = (this.getAttribute("current-env") || "prod").toLowerCase();
+    this.currentProduct = this.getAttribute("current-product") || "Customer 1.0";
+    const hasExplicitEnv = this.hasAttribute("current-env");
+    const hasExplicitProduct = this.hasAttribute("current-product");
+
+    const attrUrl = this.getAttribute("links-url");
+    const hostname = window.location.hostname;
+    this.isLocal = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "";
+
+    // 2. Resolve the official CDN URL — always used for auto-detection so that
+    //    a rogue links-url attribute cannot spoof or bypass prod enforcement.
+    //    Detection MUST run against the official source; if it ran against a
+    //    consumer-supplied URL, a modified links.json that omits the prod
+    //    hostname could silently bypass the lock-down below.
+    const officialUrl = this.isLocal
+      ? await NavigationService.resolveLocalUrl()
+      : _SCRIPT_BASE
+        ? _SCRIPT_BASE + "links.json"
+        : "https://dnnuu05gzae40.cloudfront.net/links.json";
+
+    this.linksUrl = officialUrl;
+
+    // Render the shell synchronously so the button appears immediately.
+    this.renderShell();
+    document.addEventListener("click", this.handleOutsideClick);
+
+    // 3. Auto-detect env and product from the OFFICIAL links.json.
+    //    The fetch result is cached, so opening the dropdown right after
+    //    costs no additional network request.
+    const rawData = await NavigationService.getRawLinks(officialUrl, this.isLocal);
+    if (rawData) {
+      // Extract display names from the data so the code stays generic.
+      for (const [key, envs] of Object.entries(rawData)) {
+        if (envs._displayName) this.displayNames[key] = envs._displayName;
+      }
+
+      const detected = NavigationService.detectContext(rawData, hostname);
+      if (detected && detected.env === "prod") {
+        // Official prod URL confirmed — hard-lock env, product, and links
+        // source.  No attribute (links-url, current-env, current-product)
+        // can override this.  Early return prevents step 4 from running.
+        this.currentEnv = detected.env;
+        this.currentProduct = detected.product;
+        this.currentRegion = detected.region;
+        this._prodLocked = true;
+        // this.linksUrl is already officialUrl — no change needed.
+        return;
+      } else if (detected) {
+        // Non-prod URL detected — apply only when no explicit attribute set.
+        if (!hasExplicitEnv) this.currentEnv = detected.env;
+        if (!hasExplicitProduct) this.currentProduct = detected.product;
+        this.currentRegion = detected.region;
+      }
+    }
+
+    // 4. Not on an official prod URL — honor links-url attribute if provided.
+    //    This allows local dev and non-prod environments to use custom sources
+    //    (e.g., testing with a local links.json while forcing current-env="prod").
+    if (attrUrl) {
+      this.linksUrl = attrUrl;
+    }
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener("click", this.handleOutsideClick);
+  }
+
+  /**
+   * Change the active environment at runtime. Only works on non-prod URLs.
+   * Usage (browser console): ixNavSetEnv("stage")
+   */
+  setEnv(env) {
+    if (this._prodLocked) {
+      console.warn("UnifiedNav: cannot change environment on a prod-locked URL.");
+      return;
+    }
+    this.currentEnv = env.toLowerCase();
+    this.data = null;
+    if (this.isOpen) {
+      this.fetchAndRenderData();
+    } else {
+      console.log(`UnifiedNav: environment set to "${this.currentEnv}". Open the menu to load updated links.`);
+    }
+  }
+
+  async toggleDropdown() {
+    this.isOpen = !this.isOpen;
+    const dropdown = this.shadowRoot.querySelector(".dropdown-panel");
+
+    if (this.isOpen) {
+      // Align left edge under the button when the widget is in the left half of the viewport.
+      const rect = this.getBoundingClientRect();
+      const onLeft = rect.left + rect.width / 2 < window.innerWidth / 2;
+      dropdown.classList.toggle("align-left", onLeft);
+      dropdown.classList.add("open");
+      // Fetch if we don't have data, OR if we are local (to allow real-time JSON edits)
+      if (!this.data || this.isLocal) {
+        await this.fetchAndRenderData();
+      }
+    } else {
+      this.closePanel();
+    }
+  }
+
+  closePanel() {
+    this.isOpen = false;
+    const dropdown = this.shadowRoot.querySelector(".dropdown-panel");
+    if (!dropdown) return;
+    dropdown.classList.remove("open");
+    dropdown.querySelectorAll(".submenu-panel.open").forEach((p) => {
+      p.classList.remove("open");
+      p.addEventListener(
+        "transitionend",
+        () => {
+          if (!p.classList.contains("open")) p.classList.remove("flip");
+        },
+        { once: true },
+      );
+    });
+    dropdown.querySelectorAll(".menu-item-btn.active").forEach((b) => b.classList.remove("active"));
+  }
+
+  handleOutsideClick(event) {
+    if (!this.isOpen) return;
+    const path = event.composedPath();
+    if (!path.includes(this)) {
+      this.closePanel();
+    }
+  }
+
+  async fetchAndRenderData() {
+    this.isLoading = true;
+    this.hasError = false;
+    this.renderContent();
+
+    // Pass the resolved URL and local status to the Service
+    const fetchedData = await NavigationService.getLinks(this.currentEnv, this.linksUrl, this.isLocal);
+
+    this.isLoading = false;
+    if (!fetchedData) {
+      this.hasError = true;
+    } else {
+      this.data = fetchedData;
+    }
+
+    this.renderContent();
+    if (!this.hasError) this.attachSubmenuListeners();
+  }
+
+  attachSubmenuListeners() {
+    const items = this.shadowRoot.querySelectorAll(".menu-item");
+    items.forEach((item) => {
+      const btn = item.querySelector(".menu-item-btn");
+      const newBtn = btn.cloneNode(true);
+      btn.parentNode.replaceChild(newBtn, btn);
+
+      newBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const submenu = item.querySelector(".submenu-panel");
+        const isOpen = submenu.classList.contains("open");
+
+        // Remove "open" immediately but defer removing "flip" until the close
+        // transition finishes — otherwise the panel jumps to the right-side
+        // position while still fading out, causing a visible flash.
+        this.shadowRoot.querySelectorAll(".submenu-panel.open").forEach((p) => {
+          p.classList.remove("open");
+          p.addEventListener(
+            "transitionend",
+            () => {
+              if (!p.classList.contains("open")) p.classList.remove("flip");
+            },
+            { once: true },
+          );
+        });
+        this.shadowRoot.querySelectorAll(".menu-item-btn.active").forEach((b) => b.classList.remove("active"));
+
+        if (!isOpen) {
+          // Measure position while still hidden to decide which side to open on.
+          // The hidden state has transform: translateX(-8px), so add 8 px back for the real right edge.
+          const rect = submenu.getBoundingClientRect();
+          if (rect.right + 8 > window.innerWidth) {
+            submenu.classList.add("flip");
+          }
+          submenu.classList.add("open");
+          newBtn.classList.add("active");
+        }
+      });
+    });
+  }
+
+  generateSubmenuHTML(links) {
+    return links
+      .map((link) => {
+        if (link.sidekick && link.admin) {
+          return `
+                    <li><a class="menu-link" href="${link.sidekick}" target="_blank" rel="noopener noreferrer">${link.name} – Sidekick</a></li>
+                    <li><a class="menu-link" href="${link.admin}" target="_blank" rel="noopener noreferrer">${link.name} – Admin</a></li>
+                `;
+        }
+        return `<li><a class="menu-link" href="${link.url}" target="_blank" rel="noopener noreferrer">${link.name}</a></li>`;
+      })
+      .join("");
+  }
+
+  renderContent() {
+    const contentContainer = this.shadowRoot.querySelector("#dropdown-content");
+
+    if (this.isLoading) {
+      contentContainer.innerHTML = `
+                <div class="loading-state">
+                    <div class="spinner"></div>
+                    <span>Loading...</span>
+                </div>
+            `;
+      return;
+    }
+
+    if (this.hasError) {
+      contentContainer.innerHTML = `
+                <div class="error-state">
+                    Failed to load navigation data. Please try again later.
+                </div>
+            `;
+      return;
+    }
+
+    if (!this.data) return;
+
+    const products = Object.keys(this.data);
+    const displayName = (key) => this.displayNames[key] || key;
+
+    let html = '<ul class="menu-list" role="menu">';
+
+    const hostname = window.location.hostname;
+
+    products.forEach((product) => {
+      const links = this.data[product] || [];
+      const visibleLinks = links.filter((link) => {
+        // Region filter: hide links from other regions
+        if (this.currentRegion && link.region && link.region !== this.currentRegion) return false;
+        const candidates = [link.url, link.sidekick, link.admin].filter(Boolean);
+        return !candidates.some((url) => {
+          try {
+            return new URL(url).hostname === hostname;
+          } catch {
+            return false;
+          }
+        });
+      });
+
+      if (visibleLinks.length === 0) {
+        html += `
+                <li class="menu-item" role="none">
+                    <button class="menu-item-btn disabled" role="menuitem" aria-disabled="true" disabled>
+                        ${displayName(product)}
+                    </button>
+                </li>
+            `;
+      } else if (visibleLinks.length === 1) {
+        const link = visibleLinks[0];
+        const href = link.url || link.sidekick;
+        html += `
+                <li class="menu-item" role="none">
+                    <a class="menu-item-btn menu-item-link" role="menuitem" href="${href}" target="_blank" rel="noopener noreferrer">
+                        ${displayName(product)}
+                    </a>
+                </li>
+            `;
+      } else {
+        html += `
+                <li class="menu-item" role="none">
+                    <button class="menu-item-btn" role="menuitem" aria-haspopup="true">
+                        ${displayName(product)}
+                    </button>
+                    <div class="submenu-panel">
+                        <ul class="menu-list" role="menu">
+                            ${this.generateSubmenuHTML(visibleLinks)}
+                        </ul>
+                    </div>
+                </li>
+            `;
+      }
+    });
+
+    html += "</ul>";
+    contentContainer.innerHTML = html;
+  }
+
+  renderShell() {
+    this.shadowRoot.innerHTML = `
+            <style>
+                /* ── Customisable Design Tokens ───────────────────────────────────
+                   Set any --ix-nav-* property on <ix-unified-nav> or an ancestor
+                   to override the FDS defaults.  CSS custom properties pierce the
+                   Shadow DOM boundary, so external stylesheets work.
+
+                   COLOURS
+                     --ix-nav-primary              Brand primary          (#003d5b)
+                     --ix-nav-primary-dark         Darker / hover         (#002a3f)
+                     --ix-nav-primary-contrast     Text on primary bg     (#ffffff)
+                     --ix-nav-text-color           Main text              (#121212)
+                     --ix-nav-text-secondary       Secondary text         (#6c6d6e)
+                     --ix-nav-text-disabled        Disabled / muted       (#b4b5b6)
+                     --ix-nav-bg                   Panel background       (#ffffff)
+                     --ix-nav-surface-bg           Subtle surface bg      (#f5f7f9)
+                     --ix-nav-border-color         Border lines           (#1212121f)
+                     --ix-nav-error                Error colour           (#cc3246)
+                     --ix-nav-link-hover-bg        Link item hover bg     (#003d5b0a)
+                     --ix-nav-action-hover-bg      Accordion hover bg     (#1212120a)
+
+                   TYPOGRAPHY
+                     --ix-nav-font-family                 Body font stack
+                     --ix-nav-font-size                   Body text size        (14px)
+                     --ix-nav-font-size-sm                Caption / small text  (12px)
+                     --ix-nav-menu-item-font-weight       Menu item weight      (inherit)
+
+                   TRIGGER BUTTON
+                     --ix-nav-trigger-size         Width & height         (36px)
+                     --ix-nav-trigger-icon-size    SVG icon size          (22px)
+                     --ix-nav-trigger-border       Border colour          (rgba 255 255 255 / .2)
+                     --ix-nav-trigger-hover-bg     Hover background       (rgba 255 255 255 / .1)
+                     --ix-nav-trigger-hover-border Hover border           (rgba 255 255 255 / .4)
+                     --ix-nav-trigger-focus-ring   Focus outline          (rgba 255 255 255 / .5)
+
+                   DROPDOWN PANEL
+                     --ix-nav-dropdown-width       Panel width            (340px)
+                     --ix-nav-dropdown-max-height  Max panel height       (80vh)
+                     --ix-nav-dropdown-shadow      Box shadow
+
+                   LAYOUT
+                     --ix-nav-border-radius        Corner rounding        (4px)
+                     --ix-nav-spacing-xs           Extra-small spacing    (8px)
+                     --ix-nav-spacing-sm           Small spacing          (12px)
+                     --ix-nav-spacing-md           Medium spacing         (16px)
+                     --ix-nav-spacing-lg           Large spacing          (24px)
+
+                   BADGE (environment label)
+                     --ix-nav-badge-bg             Badge background       (= primary)
+                     --ix-nav-badge-color          Badge text colour      (= primary-contrast)
+                ──────────────────────────────────────────────────────────────── */
+                :host {
+                    /* ── Internal tokens resolved from public --ix-nav-* API ── */
+
+                    /* Typography */
+                    --fds-font-body:        var(--ix-nav-font-family, "Noto Sans", -apple-system, BlinkMacSystemFont, sans-serif);
+                    --fds-font-display:     "Noto Sans Display", -apple-system, BlinkMacSystemFont, sans-serif;
+
+                    --fds-body2-size:       var(--ix-nav-font-size, 14px);
+                    --fds-body2-weight:     400;
+                    --fds-body2-lh:         20.02px;
+                    --fds-body2-ls:         0.17px;
+
+                    --fds-caption-size:     var(--ix-nav-font-size-sm, 12px);
+                    --fds-caption-weight:   400;
+                    --fds-caption-lh:       19.92px;
+                    --fds-caption-ls:       0.4px;
+                    --fds-overline-ls:      1px;
+
+                    --fds-sub2-size:        var(--ix-nav-font-size, 14px);
+                    --fds-sub2-weight:      500;
+                    --fds-sub2-lh:          21.98px;
+                    --fds-sub2-ls:          0.1px;
+
+                    --fds-overline-lh:      31.92px;
+
+                    /* Colours */
+                    --fds-text-primary:     var(--ix-nav-text-color, #121212);
+                    --fds-text-secondary:   var(--ix-nav-text-secondary, #6c6d6e);
+                    --fds-text-disabled:    var(--ix-nav-text-disabled, #b4b5b6);
+                    --fds-bg:               var(--ix-nav-bg, #ffffff);
+                    --fds-primary:          var(--ix-nav-primary, #003d5b);
+                    --fds-primary-light:    #33637b;
+                    --fds-primary-dark:     var(--ix-nav-primary-dark, #002a3f);
+                    --fds-primary-contrast: var(--ix-nav-primary-contrast, #ffffff);
+                    --fds-primary-hover:    var(--ix-nav-link-hover-bg, #003d5b0a);
+                    --fds-primary-selected: #003d5b14;
+                    --fds-primary-focus:    #003d5b1f;
+                    --fds-primary-focus-visible: #003d5b4d;
+                    --fds-secondary:        #25e2cc;
+                    --fds-secondary-dark:   #199e8e;
+                    --fds-error:            var(--ix-nav-error, #cc3246);
+                    --fds-action-active:    #1212128f;
+                    --fds-action-hover:     var(--ix-nav-action-hover-bg, #1212120a);
+                    --fds-action-selected:  #12121214;
+                    --fds-action-focus:     #12121229;
+                    --fds-action-disabled:  #12121261;
+                    --fds-action-disabled-bg: var(--ix-nav-border-color, #1212121f);
+
+                    /* Shapes & Spacing */
+                    --fds-radius-sm:        var(--ix-nav-border-radius, 4px);
+                    --fds-radius-full:      200px;
+                    --fds-border-default:   1px;
+                    --fds-border-selected:  2px;
+                    --fds-border-focus:     3px;
+                    --fds-pad-3xs:          4px;
+                    --fds-pad-2xs:          6px;
+                    --fds-pad-xs:           var(--ix-nav-spacing-xs, 8px);
+                    --fds-pad-sm:           var(--ix-nav-spacing-sm, 12px);
+                    --fds-pad-base:         var(--ix-nav-spacing-md, 16px);
+                    --fds-pad-lg:           var(--ix-nav-spacing-lg, 24px);
+                    --fds-mar-xs:           var(--ix-nav-spacing-xs, 8px);
+                    --fds-mar-sm:           var(--ix-nav-spacing-sm, 12px);
+                    --fds-mar-base:         var(--ix-nav-spacing-md, 16px);
+
+                    /* Surface */
+                    --fds-surface-subtle:   var(--ix-nav-surface-bg, #f5f7f9);
+
+                    /* Trigger button */
+                    --_trigger-size:        var(--ix-nav-trigger-size, 36px);
+                    --_trigger-icon-size:   var(--ix-nav-trigger-icon-size, 22px);
+                    --_trigger-border:      var(--ix-nav-trigger-border, rgba(255, 255, 255, 0.2));
+                    --_trigger-hover-bg:    var(--ix-nav-trigger-hover-bg, rgba(255, 255, 255, 0.1));
+                    --_trigger-hover-border: var(--ix-nav-trigger-hover-border, rgba(255, 255, 255, 0.4));
+                    --_trigger-focus-ring:  var(--ix-nav-trigger-focus-ring, rgba(255, 255, 255, 0.5));
+
+                    /* Dropdown panel */
+                    --_dropdown-width:      var(--ix-nav-dropdown-width, 200px);
+                    --_dropdown-max-height: var(--ix-nav-dropdown-max-height, 80vh);
+                    --_dropdown-shadow:     var(--ix-nav-dropdown-shadow, 0 10px 25px -5px rgba(0, 0, 0, 0.15), 0 8px 10px -6px rgba(0, 0, 0, 0.1));
+
+                    /* Environment badge */
+                    --_badge-bg:            var(--ix-nav-badge-bg, var(--fds-primary));
+                    --_badge-color:         var(--ix-nav-badge-color, var(--fds-primary-contrast));
+
+                    font-family: var(--fds-font-body);
+                    display: inline-block;
+                    position: relative;
+                }
+                * { box-sizing: border-box; }
+
+                /* Trigger button — sits in the host app's navbar (inherits its text color) */
+                .trigger-btn {
+                    background-color: transparent;
+                    color: inherit;
+                    border: var(--fds-border-default) solid var(--_trigger-border);
+                    padding: var(--fds-pad-xs);
+                    border-radius: var(--fds-radius-sm);
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: var(--_trigger-size);
+                    height: var(--_trigger-size);
+                    transition: all 0.2s ease;
+                }
+                .trigger-btn:hover {
+                    background-color: var(--_trigger-hover-bg);
+                    border-color: var(--_trigger-hover-border);
+                }
+                .trigger-btn:focus-visible {
+                    outline: var(--fds-border-focus) solid var(--_trigger-focus-ring);
+                    outline-offset: 2px;
+                }
+                .trigger-btn svg {
+                    width: var(--_trigger-icon-size);
+                    height: var(--_trigger-icon-size);
+                    fill: currentColor;
+                    display: block;
+                    flex-shrink: 0;
+                }
+
+                /* Dropdown panel */
+                .dropdown-panel {
+                    position: absolute;
+                    top: calc(100% + var(--fds-mar-xs));
+                    right: 0;
+                    left: auto;
+                    width: var(--_dropdown-width);
+                    background: var(--fds-bg);
+                    border-radius: var(--fds-radius-sm);
+                    box-shadow: var(--_dropdown-shadow);
+                    border: var(--fds-border-default) solid var(--fds-action-disabled-bg);
+                    color: var(--fds-text-primary);
+                    z-index: 1000;
+                    opacity: 0;
+                    visibility: hidden;
+                    transform: translateY(-10px);
+                    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+                    overflow: visible;
+                    text-align: left;
+                }
+                .dropdown-panel.open { opacity: 1; visibility: visible; transform: translateY(0); }
+                /* When the widget sits near the left edge, anchor the panel's left side instead */
+                .dropdown-panel.align-left { left: 0; right: auto; }
+
+                /* Loading state */
+                .loading-state {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    justify-content: center;
+                    padding: var(--fds-pad-lg) var(--fds-pad-base);
+                    color: var(--fds-text-secondary);
+                    font-size: var(--fds-body2-size);
+                    line-height: var(--fds-body2-lh);
+                }
+                .spinner {
+                    width: 24px;
+                    height: 24px;
+                    border: var(--fds-border-focus) solid var(--fds-action-disabled-bg);
+                    border-top-color: var(--fds-primary);
+                    border-radius: var(--fds-radius-full);
+                    animation: spin 1s linear infinite;
+                    margin-bottom: var(--fds-mar-sm);
+                }
+                @keyframes spin { to { transform: rotate(360deg); } }
+
+                /* Menu list (MUI-style Paper / MenuList / MenuItem) */
+                .menu-list {
+                    list-style: none;
+                    margin: 0;
+                    padding: var(--fds-pad-xs) 0;
+                }
+                .menu-item {
+                    position: relative;
+                }
+                .menu-item-btn {
+                    width: 100%;
+                    background: none;
+                    border: none;
+                    padding: 0 var(--fds-pad-base);
+                    min-height: 40px;
+                    font-family: var(--fds-font-body);
+                    font-size: var(--fds-body2-size);
+                    font-weight: var(--ix-nav-menu-item-font-weight, inherit);
+                    color: var(--fds-text-primary);
+                    text-align: left;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    line-height: 1.5;
+                    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+                }
+                .menu-item-btn:hover {
+                    background-color: var(--fds-action-hover);
+                }
+                .menu-item-btn.active {
+                    background-color: var(--fds-action-selected);
+                }
+                .menu-item-btn:focus-visible {
+                    outline: var(--fds-border-focus) solid var(--fds-primary-focus-visible);
+                    outline-offset: -2px;
+                }
+                .menu-item-btn.disabled {
+                    color: var(--fds-text-disabled);
+                    cursor: default;
+                    pointer-events: none;
+                }
+                .menu-item-link {
+                    color: var(--fds-text-primary);
+                    text-decoration: none;
+                }
+                .menu-item-link:hover {
+                    color: var(--fds-text-primary);
+                    text-decoration: none;
+                }
+                /* Submenu panel */
+                .submenu-panel {
+                    position: absolute;
+                    left: 100%;
+                    top: 0;
+                    width: max-content;
+                    min-width: unset;
+                    background: var(--fds-bg);
+                    border-radius: var(--fds-radius-sm);
+                    box-shadow: var(--_dropdown-shadow);
+                    border: var(--fds-border-default) solid var(--fds-action-disabled-bg);
+                    opacity: 0;
+                    visibility: hidden;
+                    transform: translateX(-8px);
+                    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+                    z-index: 1001;
+                }
+                /* Flip to left side when right edge would overflow the viewport */
+                .submenu-panel.flip {
+                    left: auto;
+                    right: 100%;
+                    transform: translateX(8px);
+                }
+                .submenu-panel.open {
+                    opacity: 1;
+                    visibility: visible;
+                    transform: translateX(0);
+                }
+                .submenu-panel .menu-list {
+                    max-height: 60vh;
+                    overflow-y: auto;
+                }
+                .menu-link {
+                    display: flex;
+                    align-items: center;
+                    padding: 0 var(--fds-pad-base);
+                    min-height: 40px;
+                    color: var(--fds-text-primary);
+                    text-decoration: none;
+                    font-size: var(--fds-body2-size);
+                    line-height: 1.5;
+                    white-space: nowrap;
+                    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+                }
+                .menu-link:hover {
+                    background-color: var(--fds-action-hover);
+                    color: var(--fds-text-primary);
+                    text-decoration: none;
+                }
+                .menu-item-empty {
+                    padding: var(--fds-pad-2xs) var(--fds-pad-base);
+                    color: var(--fds-text-disabled);
+                    font-size: var(--fds-body2-size);
+                    font-style: italic;
+                    list-style: none;
+                }
+                .error-state {
+                    padding: var(--fds-pad-lg) var(--fds-pad-base);
+                    text-align: center;
+                    color: var(--fds-error);
+                    font-size: var(--fds-body2-size);
+                }
+            </style>
+
+            <button class="trigger-btn" aria-haspopup="true" aria-label="Environment & Apps">
+                <!-- AppsRounded icon from MUI / Material Icons -->
+                <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+                    <path d="M4 8h4V4H4v4zm6 12h4v-4h-4v4zm-6 0h4v-4H4v4zm0-6h4v-4H4v4zm6 0h4v-4h-4v4zm6-10v4h4V4h-4zm-6 4h4V4h-4v4zm6 6h4v-4h-4v4zm0 6h4v-4h-4v4z"/>
+                </svg>
+            </button>
+            <div class="dropdown-panel">
+                <div id="dropdown-content">
+                    <!-- Dynamic content gets injected here -->
+                </div>
+            </div>
+        `;
+
+    this.shadowRoot.querySelector(".trigger-btn").addEventListener("click", this.toggleDropdown);
+  }
+}
+
+customElements.define("ix-unified-nav", UnifiedNav);
+
+/**
+ * Console helper — change the active environment on all <ix-unified-nav> instances
+ * without a page reload. Only works on non-prod URLs.
+ * Usage: ixNavSetEnv("dev") | ixNavSetEnv("stage") | ixNavSetEnv("qa")
+ */
+window.ixNavSetEnv = (env) => {
+  document.querySelectorAll("ix-unified-nav").forEach((el) => el.setEnv(env));
+};
