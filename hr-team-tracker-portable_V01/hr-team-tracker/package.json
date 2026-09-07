@@ -1,0 +1,11 @@
+{
+  "name": "hr-team-tracker",
+  "version": "1.0.0",
+  "description": "HR Team Tracker · MVP 1 · app estática con Supabase opcional",
+  "type": "module",
+  "scripts": {
+    "serve": "npx --yes serve .",
+    "seed": "node supabase/seed.js"
+  },
+  "license": "MIT"
+}

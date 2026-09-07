@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HR Team Tracker · Concentrix</title>
+<meta name="description" content="Gestión de Capacidad y Staffing – MVP 1"/>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%9A%99%EF%B8%8F%3C/text%3E%3C/svg%3E"/>
+<link rel="stylesheet" href="./css/styles.css"/>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>⚙️ HR Team Tracker</h1>
+    <span>Concentrix · Seguimiento de Capacidades & Proyectos · Julio 2026</span>
+  </div>
+</header>
+
+<nav>
+  <button class="active" onclick="showPage('staff')">👥 Staff & Capacidades</button>
+  <button onclick="showPage('proyectos')">📁 Proyectos</button>
+  <button onclick="showPage('mantenimientos')">🔧 Mantenimientos</button>
+  <button onclick="showPage('mapa')">📊 Mapa de Asignaciones</button>
+</nav>
+
+<!-- ========== STAFF ========== -->
+<div id="staff" class="page active">
+  <div class="kpi-row">
+    <div class="kpi"><div class="num">28</div><div class="lbl">Consultores en Team</div></div>
+    <div class="kpi"><div class="num">13</div><div class="lbl">Contractors [C]</div></div>
+    <div class="kpi"><div class="num">15</div><div class="lbl">Empleados Dir.</div></div>
+    <div class="kpi"><div class="num">16</div><div class="lbl">Skills / Módulos</div></div>
+    <div class="kpi"><div class="num">6</div><div class="lbl">Roles distintos</div></div>
+  </div>
+
+  <div class="filters">
+    <input id="searchStaff" oninput="filterStaff()" placeholder="🔍 Buscar por nombre..."/>
+    <select id="filterRol" onchange="filterStaff()">
+      <option value="">Todos los roles</option>
+      <option>EC</option><option>PY</option><option>LD</option>
+      <option>TM</option><option>TT</option><option>Int</option><option>LMS</option>
+    </select>
+    <select id="filterTipo" onchange="filterStaff()">
+      <option value="">Empleado / Contractor</option>
+      <option value="C">Contractor [C]</option>
+      <option value="E">Empleado</option>
+    </select>
+  </div>
+
+  <table id="staffTable">
+    <thead>
+      <tr>
+        <th>#</th><th>Nombre</th><th>Tipo</th><th>Rol</th><th>Seniority</th><th>Lider</th>
+        <th>PY</th><th>TM</th><th>PA/OM</th><th>EC</th><th>TT</th><th>PM GM</th>
+        <th>SMD</th><th>RCM</th><th>LMS</th><th>OPM</th><th>INT</th><th>ABAP</th>
+      </tr>
+    </thead>
+    <tbody id="staffBody"></tbody>
+  </table>
+</div>
+
+<!-- ========== PROYECTOS ========== -->
+<div id="proyectos" class="page">
+  <div class="kpi-row">
+    <div class="kpi"><div class="num">3</div><div class="lbl">Proyectos Activos</div></div>
+    <div class="kpi"><div class="num">6</div><div class="lbl">Recursos asignados</div></div>
+    <div class="kpi"><div class="num">6.592</div><div class="lbl">Hs totales estimadas</div></div>
+  </div>
+  <div class="card-grid" id="proyCards"></div>
+</div>
+
+<!-- ========== MANTENIMIENTOS ========== -->
+<div id="mantenimientos" class="page">
+  <div class="kpi-row">
+    <div class="kpi"><div class="num">13</div><div class="lbl">Contratos Activos</div></div>
+    <div class="kpi"><div class="num">5</div><div class="lbl">Líderes responsables</div></div>
+    <div class="kpi"><div class="num">1.986</div><div class="lbl">Hs totales mapeadas</div></div>
+  </div>
+  <div class="card-grid" id="mantCards"></div>
+</div>
+
+<!-- ========== MAPA ========== -->
+<div id="mapa" class="page">
+  <p class="section-title">📊 Asignación de horas por recurso (Julio 2026)</p>
+  <div id="mapaContent"></div>
+</div>
+
+<footer>HR Team Tracker · iX Hello · Concentrix 2026 · MVP 1.0</footer>
+
+<footer>HR Team Tracker · Concentrix 2026 · MVP 1.0 · fuente: <span id="dataSource">local</span></footer>
+
+<!-- Config (endpoints Supabase, feature flags) -->
+<script src="./js/config.js"></script>
+<!-- Datos locales (fallback offline) -->
+<script src="./js/data.js"></script>
+<!-- Capa de acceso a datos (Supabase opcional) -->
+<script src="./js/dataSource.js"></script>
+<!-- App principal (render + navegación + filtros) -->
+<script src="./js/app.js"></script>
+</body>
+</html>
